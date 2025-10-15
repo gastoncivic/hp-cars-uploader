@@ -12,10 +12,8 @@ const ALLOWED = (process.env.ALLOWED_ORIGIN || "")
   .map(s => s.trim())
   .filter(Boolean);
 
-// asegurar carpeta de subidas
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// CORS: solo tu sitio, permitir sin origin para curl/postman
 app.use(cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
@@ -34,7 +32,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
+  limits: { fileSize: 8 * 1024 * 1024 },
   fileFilter(req, file, cb) {
     const ext = path.extname(file.originalname).toLowerCase();
     const ok = [".bin", ".hex", ".kp", ".ols", ".ecu"].includes(ext);
@@ -46,6 +44,7 @@ const upload = multer({
 app.post("/uploadBin", (req, res) => {
   upload(req, res, (err) => {
     if (err) return res.status(400).json({ ok: false, error: err.message });
+    const f = req.file;
     const meta = {
       email: req.body?.email || "",
       waPrefix: req.body?.waPrefix || "",
@@ -60,7 +59,6 @@ app.post("/uploadBin", (req, res) => {
       mods: req.body?.mods || "",
       comentarios: req.body?.comentarios || ""
     };
-    const f = req.file;
     res.json({ ok: true, fileName: f.filename, size: f.size, meta });
   });
 });
