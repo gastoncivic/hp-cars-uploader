@@ -12,20 +12,18 @@ const ALLOWED = (process.env.ALLOWED_ORIGIN || "")
   .map(s => s.trim())
   .filter(Boolean);
 
-// aseguramos carpeta
+// asegurar carpeta de subidas
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// CORS: permite solo tu sitio
+// CORS: solo tu sitio, permitir sin origin para curl/postman
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true);                 // permite curl/postman
+    if (!origin) return cb(null, true);
     if (!ALLOWED.length || ALLOWED.includes(origin)) return cb(null, true);
     return cb(new Error("CORS not allowed: " + origin));
   }
 }));
 
-// Configuración de subida
-import { fileURLToPath } from "url";
 const storage = multer.diskStorage({
   destination(req, file, cb) { cb(null, UPLOAD_DIR); },
   filename(req, file, cb) {
@@ -45,13 +43,9 @@ const upload = multer({
   }
 }).single("file");
 
-// Endpoint principal
 app.post("/uploadBin", (req, res) => {
   upload(req, res, (err) => {
-    if (err) {
-      res.status(400).json({ ok: false, error: err.message });
-      return;
-    }
+    if (err) return res.status(400).json({ ok: false, error: err.message });
     const meta = {
       email: req.body?.email || "",
       waPrefix: req.body?.waPrefix || "",
@@ -71,16 +65,12 @@ app.post("/uploadBin", (req, res) => {
   });
 });
 
-// Descarga (opcional)
 app.get("/files/:name", (req, res) => {
   const p = path.join(UPLOAD_DIR, req.params.name);
   if (!fs.existsSync(p)) return res.status(404).send("Not found");
   res.download(p);
 });
 
-// Salud
-app.get("/", (_req, res) => {
-  res.type("text").send("HP Cars uploader OK");
-});
+app.get("/", (_req, res) => res.type("text").send("HP Cars uploader OK"));
 
 app.listen(PORT, () => console.log("Uploader running on", PORT));
