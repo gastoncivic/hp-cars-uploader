@@ -8,9 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const UPLOAD_DIR = process.env.UPLOAD_DIR || "uploads";
 const ALLOWED = (process.env.ALLOWED_ORIGIN || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(",").map(s => s.trim()).filter(Boolean);
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -45,29 +43,35 @@ app.post("/uploadBin", (req, res) => {
   upload(req, res, (err) => {
     if (err) return res.status(400).json({ ok: false, error: err.message });
     const f = req.file;
-    const meta = {
-      email: req.body?.email || "",
-      waPrefix: req.body?.waPrefix || "",
-      waNumber: req.body?.waNumber || "",
-      marca: req.body?.marca || "",
-      modelo: req.body?.modelo || "",
-      anio: req.body?.anio || "",
-      motor: req.body?.motor || "",
-      combustible: req.body?.combustible || "",
-      transmision: req.body?.transmision || "",
-      ecu: req.body?.ecu || "",
-      mods: req.body?.mods || "",
-      comentarios: req.body?.comentarios || ""
-    };
-    res.json({ ok: true, fileName: f.filename, size: f.size, meta });
+    res.json({ ok: true, fileName: f.filename, size: f.size, url: `/files/${encodeURIComponent(f.filename)}` });
   });
 });
 
-app.get("/files/:name", (req, res) => {
-  const p = path.join(UPLOAD_DIR, req.params.name);
-  if (!fs.existsSync(p)) return res.status(404).send("Not found");
-  res.download(p);
+// === NUEVO: listar archivos con metadatos ===
+app.get("/api/files", async (req, res) => {
+  try {
+    const files = await fs.promises.readdir(UPLOAD_DIR);
+    const list = await Promise.all(files.map(async (name) => {
+      const full = path.join(UPLOAD_DIR, name);
+      const st = await fs.promises.stat(full);
+      return {
+        name,
+        size: st.size,
+        mtime: st.mtimeMs,
+        url: `/files/${encodeURIComponent(name)}`
+      };
+    }));
+    list.sort((a,b) => b.mtime - a.mtime);
+    res.json({ ok: true, files: list });
+  } catch (e) {
+    res.json({ ok: true, files: [] });
+  }
 });
+
+// === NUEVO: servir los archivos para descarga
+app.use("/files", express.static(UPLOAD_DIR, {
+  maxAge: "1h",
+}));
 
 app.get("/", (_req, res) => res.type("text").send("HP Cars uploader OK"));
 
