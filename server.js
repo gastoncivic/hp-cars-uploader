@@ -1,193 +1,396 @@
+
 import express from "express";
-import multer from "multer";
 import cors from "cors";
+import multer from "multer";
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
 import nodemailer from "nodemailer";
+import { v4 as uuidv4 } from "uuid";
+import mercadopago from "mercadopago";
+import paypal from "@paypal/checkout-server-sdk";
+import admin from "firebase-admin";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 8080;
-const UPLOAD_DIR = process.env.UPLOAD_DIR || "uploads";
-const RESULTS_DIR = process.env.RESULTS_DIR || "results";
-const ALLOWED = (process.env.ALLOWED_ORIGIN || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
-const ADMIN_KEY = process.env.ADMIN_KEY || "";
-
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-fs.mkdirSync(RESULTS_DIR, { recursive: true });
-
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (!ALLOWED.length || ALLOWED.includes(origin)) return cb(null, true);
-    return cb(new Error("CORS not allowed: " + origin));
-  }
-}));
-
-app.use(express.json());
+app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-function makeStorage(dest){
-  return multer.diskStorage({
-    destination(_req, _file, cb){ cb(null, dest); },
-    filename(_req, file, cb){
-      const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-      cb(null, Date.now()+"_"+safe);
-    }
-  });
+// ====== ENV ======
+const PORT = process.env.PORT || 8080;
+const ADMIN_KEY = process.env.ADMIN_KEY || "change-me";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const PUBLIC_BASE = process.env.PUBLIC_BASE || `http://localhost:${PORT}`;
+
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || "0", 10);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const MAIL_FROM  = process.env.MAIL_FROM || SMTP_USER || "no-reply@hp-cars.local";
+
+// Mercado Pago
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || "";
+if (MP_ACCESS_TOKEN) mercadopago.configure({ access_token: MP_ACCESS_TOKEN });
+
+// PayPal
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "";
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || "";
+const PAYPAL_ENV = (process.env.PAYPAL_ENV || "sandbox").toLowerCase();
+function paypalClient() {
+  const Environment = PAYPAL_ENV === "live"
+    ? paypal.core.LiveEnvironment
+    : paypal.core.SandboxEnvironment;
+  return new paypal.core.PayPalHttpClient(new Environment(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET));
 }
 
-function allowed(exts){ return (name)=> exts.includes(path.extname(name).toLowerCase()); }
-
-const uploadOrig = multer({
-  storage: makeStorage(UPLOAD_DIR),
-  limits: { fileSize: 8*1024*1024 },
-  fileFilter(_req, file, cb){
-    const ok = allowed([".bin",".hex",".kp",".ols",".ecu"])(file.originalname);
-    if(!ok) return cb(new Error("Tipo de archivo no permitido"));
-    cb(null,true);
+// Firebase Admin (token verification)
+try {
+  if (!admin.apps.length && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+      }),
+    });
+    console.log("Firebase Admin inicializado");
   }
-}).single("file");
+} catch (e) {
+  console.warn("Firebase Admin no inicializado:", e.message);
+}
+
+// ====== CORS ======
+app.use(cors({
+  origin: function(origin, cb) {
+    if (!origin || ALLOWED_ORIGIN === "*" || origin === ALLOWED_ORIGIN) return cb(null, true);
+    return cb(new Error("Not allowed by CORS: " + origin));
+  },
+  credentials: true
+}));
+
+// ====== Storage & DB ======
+const FILES_DIR = path.join(__dirname, "files");
+const RESULTS_DIR = path.join(__dirname, "results");
+const DATA_DIR = path.join(__dirname, "data");
+const ORDERS_DB = path.join(DATA_DIR, "orders.json");
+fs.mkdirSync(FILES_DIR, { recursive: true });
+fs.mkdirSync(RESULTS_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function loadOrders() {
+  if (!fs.existsSync(ORDERS_DB)) {
+    fs.writeFileSync(ORDERS_DB, JSON.stringify({ orders: [] }, null, 2));
+  }
+  const raw = fs.readFileSync(ORDERS_DB, "utf-8");
+  return JSON.parse(raw);
+}
+function saveOrders(db) {
+  fs.writeFileSync(ORDERS_DB, JSON.stringify(db, null, 2));
+}
+
+// ====== Auth middleware (verifica Firebase token si está activo) ======
+async function verifyAuth(req, res, next) {
+  if (!admin.apps.length) return next(); // sin verificación si no config
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ ok:false, error:"Missing Bearer token" });
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.user = decoded;
+    return next();
+  } catch (e) {
+    return res.status(401).json({ ok:false, error:"Invalid token" });
+  }
+}
+
+// ====== Uploads ======
+const allowedExts = [".bin",".hex",".kp",".ols",".ecu"];
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, FILES_DIR),
+    filename: (req, file, cb) => {
+      const safe = file.originalname.replace(/[^\w\-.]+/g, "_");
+      cb(null, `${Date.now()}_${safe}`);
+    }
+  }),
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (!allowedExts.includes(ext)) return cb(new Error("Tipo de archivo no permitido"));
+    cb(null, true);
+  }
+});
 
 const uploadResult = multer({
-  storage: makeStorage(RESULTS_DIR),
-  limits: { fileSize: 16*1024*1024 },
-  fileFilter(_req, file, cb){
-    const ok = allowed([".bin",".hex",".kp",".ols",".ecu",".zip"])(file.originalname);
-    if(!ok) return cb(new Error("Tipo de archivo no permitido"));
-    cb(null,true);
-  }
-}).single("result");
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, RESULTS_DIR),
+    filename: (req, file, cb) => {
+      const safe = file.originalname.replace(/[^\w\-.]+/g, "_");
+      cb(null, `${Date.now()}_${safe}`);
+    }
+  }),
+  limits: { fileSize: 32 * 1024 * 1024 }
+});
 
-// Helper: write/read metadata JSON alongside filename
-async function writeMetaJSON(dir, fileName, data){
-  const p = path.join(dir, fileName + ".json");
-  await fs.promises.writeFile(p, JSON.stringify(data, null, 2));
-}
-async function readMetaJSON(dir, fileName){
-  try{
-    const p = path.join(dir, fileName + ".json");
-    const raw = await fs.promises.readFile(p, "utf-8");
-    return JSON.parse(raw);
-  }catch(_){ return null; }
-}
+// ====== Static ======
+app.use("/files", express.static(FILES_DIR));
+app.use("/results", express.static(RESULTS_DIR));
 
-// === Subir ORIGINAL + guardar metadata del formulario ===
-app.post("/uploadBin", (req, res)=>{
-  uploadOrig(req, res, async (err)=>{
-    if(err) return res.status(400).json({ ok:false, error: err.message });
-    const f = req.file;
-    const url = `/files/${encodeURIComponent(f.filename)}`;
-    // Capturamos metadata enviada desde el form
+// ====== Health ======
+app.get("/", (req, res) => res.json({ ok: true, msg: "API OK" }));
+
+// ====== Upload original & create order ======
+app.post("/uploadBin", verifyAuth, upload.single("file"), (req, res) => {
+  try {
+    const body = req.body || {};
+    const email = (body.email || (req.user?.email || "")).toString();
     const meta = {
-      when: Date.now(),
-      email: (req.body.email || "").toString(),
-      whatsapp: (req.body.whatsapp || req.body.whatsApp || "").toString(),
-      marca: req.body.marca || req.body.brand || "",
-      modelo: req.body.modelo || req.body.model || "",
-      motor: req.body.motor || "",
-      combustible: req.body.combustible || "",
-      anio: req.body.anio || req.body.year || "",
-      transmision: req.body.transmision || req.body.transmision || "",
-      ecu: req.body.ecu || "",
-      soluciones: {
-        egrOff: !!req.body.egr_off || req.body.egr_off==="on",
-        dpfOff: !!req.body.dpf_off || req.body.dpf_off==="on",
-        dtcOff: !!req.body.dtc_off || req.body.dtc_off==="on",
-        stage1: !!req.body.stage1 || req.body.stage1==="on",
-        stage2: !!req.body.stage2 || req.body.stage2==="on",
-        vmax:   !!req.body.vmax   || req.body.vmax==="on",
-        immoOff:!!req.body.immo_off|| req.body.immo_off==="on"
-      },
-      comentarios: req.body.comentarios || req.body.comentario || req.body.notes || ""
+      marca: body.marca || "", modelo: body.modelo || "", motor: body.motor || "",
+      combustible: body.combustible || "", anio: body.anio || "", transmision: body.transmision || "",
+      ecu: body.ecu || ""
     };
-    try{ await writeMetaJSON(UPLOAD_DIR, f.filename, meta); }catch(_){}
-    res.json({ ok:true, fileName: f.filename, size: f.size, url, metaSaved:true });
-  });
-});
-
-// === Listar ORIGINALES (enriquecidos con meta si existe) ===
-app.get("/api/files", async (_req, res)=>{
-  try{
-    const names = await fs.promises.readdir(UPLOAD_DIR);
-    const list = await Promise.all(names.filter(n => !n.endsWith(".json")).map(async name => {
-      const full = path.join(UPLOAD_DIR, name);
-      const st = await fs.promises.stat(full);
-      const meta = await readMetaJSON(UPLOAD_DIR, name);
-      return { name, size: st.size, mtime: st.mtimeMs, url: `/files/${encodeURIComponent(name)}`, meta };
-    }));
-    list.sort((a,b)=> b.mtime - a.mtime);
-    res.json({ ok:true, files: list });
-  }catch(e){
-    res.json({ ok:true, files: [] });
-  }
-});
-
-// === Listar RESULTADOS opcional ===
-app.get("/api/results", async (req,res)=>{
-  const forName = (req.query.for||"").toString();
-  try{
-    const names = await fs.promises.readdir(RESULTS_DIR);
-    const list = await Promise.all(names.filter(n => !n.endsWith(".json")).map(async name=>{
-      const full = path.join(RESULTS_DIR, name);
-      const st = await fs.promises.stat(full);
-      const meta = await readMetaJSON(RESULTS_DIR, name);
-      return { name, size: st.size, mtime: st.mtimeMs, url: `/results/${encodeURIComponent(name)}`, meta };
-    }));
-    list.sort((a,b)=> b.mtime - a.mtime);
-    const filtered = forName ? list.filter(f => f.name.includes(forName)) : list;
-    res.json({ ok:true, files: filtered });
-  }catch(e){
-    res.json({ ok:true, files: [] });
-  }
-});
-
-// === Subir RESULTADO + mail al cliente ===
-app.post("/uploadResult", (req,res)=>{
-  if(ADMIN_KEY){
-    const k = req.headers["x-admin-key"];
-    if(!k || k !== ADMIN_KEY) return res.status(401).json({ ok:false, error:"UNAUTHORIZED" });
-  }
-  uploadResult(req,res, async (err)=>{
-    if(err) return res.status(400).json({ ok:false, error: err.message });
+    const soluciones = {
+      egrOff: body.egrOff === "true" || body.egrOff === true,
+      dpfOff: body.dpfOff === "true" || body.dpfOff === true,
+      dtcOff: body.dtcOff === "true" || body.dtcOff === true,
+      stage1: body.stage1 === "true" || body.stage1 === true,
+      stage2: body.stage2 === "true" || body.stage2 === true,
+      vmax:   body.vmax === "true"   || body.vmax === true,
+      immoOff: body.immoOff === "true" || body.immoOff === true
+    };
+    const comments = body.comentarios || "";
     const file = req.file;
-    const forOriginal = (req.body.for || "").toString();
-    const customerEmail = (req.body.email || "").toString();
-    const message = (req.body.message || "").toString();
-    const url = `/results/${encodeURIComponent(file.filename)}`;
+    if (!file) return res.status(400).json({ ok:false, error:"Falta archivo" });
 
-    // Guardamos meta del resultado (vinculo y mensaje)
-    const meta = { when: Date.now(), forOriginal, email: customerEmail, message };
-    try{ await writeMetaJSON(RESULTS_DIR, file.filename, meta); }catch(_){}
-
-    // Enviar correo si hay SMTP
-    let mailed=false, mailError=null;
-    try{
-      const host = process.env.SMTP_HOST;
-      const user = process.env.SMTP_USER;
-      const pass = process.env.SMTP_PASS;
-      const port = parseInt(process.env.SMTP_PORT || "587",10);
-      const from = process.env.MAIL_FROM || user;
-      if(host && user && pass && customerEmail){
-        const transporter = nodemailer.createTransport({ host, port, secure: (port===465), auth: { user, pass } });
-        const publicBase = process.env.PUBLIC_BASE || "";
-        const fullLink = publicBase ? (publicBase.replace(/\/+$/,'') + url) : url;
-        const html = `<p>Tu archivo modificado está listo.</p>
-                      <p><a href="${fullLink}">Descargar aquí</a></p>
-                      ${message ? `<p>${message}</p>` : ""}`;
-        await transporter.sendMail({ from, to: customerEmail, subject:"HP Cars - Archivo modificado listo", html });
-        mailed=true;
-      }
-    }catch(e){ mailError = e.message || String(e); }
-
-    res.json({ ok:true, result:{ fileName:file.filename, url }, mailed, mailError });
-  });
+    const fileUrl = `${PUBLIC_BASE}/files/${path.basename(file.path)}`;
+    const order = {
+      orderId: uuidv4(),
+      userEmail: email,
+      meta, soluciones, comments,
+      originalFileName: path.basename(file.path),
+      originalFileUrl: fileUrl,
+      resultFileName: "",
+      resultFileUrl: "",
+      status: "uploaded",
+      paymentProvider: "",
+      paymentId: "",
+      paymentStatus: "",
+      rating: 0,
+      feedback: "",
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    const db = loadOrders();
+    db.orders.push(order);
+    saveOrders(db);
+    return res.json({ ok:true, order });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok:false, error:e.message });
+  }
 });
 
-// Estáticos
-app.use("/files", express.static(UPLOAD_DIR, { maxAge: "1h" }));
-app.use("/results", express.static(RESULTS_DIR, { maxAge: "1h" }));
+// ====== Orders ======
+app.get("/orders", verifyAuth, (req, res) => {
+  const email = (req.query.email || req.user?.email || "").toString();
+  const db = loadOrders();
+  const out = email ? db.orders.filter(o => (o.userEmail||"").toLowerCase() == email.toLowerCase()) : [];
+  res.json({ ok:true, orders: out });
+});
 
-app.get("/", (_req,res)=> res.type("text").send("HP Cars uploader OK"));
+// admin list all (requires ADMIN_KEY header)
+app.get("/admin/orders", (req, res) => {
+  if ((req.headers["x-admin-key"] || "") !== ADMIN_KEY) {
+    return res.status(401).json({ ok:false, error:"Unauthorized" });
+  }
+  const db = loadOrders();
+  res.json({ ok:true, orders: db.orders });
+});
 
-app.listen(PORT, ()=> console.log("Uploader running on", PORT));
+// admin: mark ready + attach result url
+app.post("/orders/:orderId/mark-ready", (req, res) => {
+  if ((req.headers["x-admin-key"] || "") !== ADMIN_KEY) {
+    return res.status(401).json({ ok:false, error:"Unauthorized" });
+  }
+  const { orderId } = req.params;
+  const { resultFileUrl } = req.body || {};
+  const db = loadOrders();
+  const idx = db.orders.findIndex(o => o.orderId === orderId);
+  if (idx < 0) return res.status(404).json({ ok:false, error:"Order not found" });
+  db.orders[idx].resultFileUrl = resultFileUrl || db.orders[idx].resultFileUrl;
+  db.orders[idx].status = "ready";
+  db.orders[idx].updatedAt = Date.now();
+  saveOrders(db);
+  res.json({ ok:true, order: db.orders[idx] });
+});
+
+// user: rate
+app.post("/orders/:orderId/rate", verifyAuth, (req, res) => {
+  const { orderId } = req.params;
+  const { rating = 0, feedback = "" } = req.body || {};
+  const db = loadOrders();
+  const idx = db.orders.findIndex(o => o.orderId === orderId && o.userEmail === (req.user?.email||""));
+  if (idx < 0) return res.status(404).json({ ok:false, error:"Order not found" });
+  db.orders[idx].rating = Math.max(0, Math.min(5, parseInt(rating,10) || 0));
+  db.orders[idx].feedback = (feedback || "").toString().slice(0, 2000);
+  db.orders[idx].updatedAt = Date.now();
+  saveOrders(db);
+  res.json({ ok:true, order: db.orders[idx] });
+});
+
+// admin: delete order
+app.delete("/orders/:orderId", (req, res) => {
+  if ((req.headers["x-admin-key"] || "") !== ADMIN_KEY) {
+    return res.status(401).json({ ok:false, error:"Unauthorized" });
+  }
+  const { orderId } = req.params;
+  const db = loadOrders();
+  const idx = db.orders.findIndex(o => o.orderId === orderId);
+  if (idx < 0) return res.status(404).json({ ok:false, error:"Order not found" });
+  const [removed] = db.orders.splice(idx,1);
+  saveOrders(db);
+  res.json({ ok:true, removed });
+});
+
+// ====== Upload result (admin) ======
+app.post("/uploadResult", uploadResult.single("file"), async (req, res) => {
+  try {
+    if ((req.headers["x-admin-key"] || "") !== ADMIN_KEY) {
+      return res.status(401).json({ ok:false, error:"Unauthorized" });
+    }
+    const { email="", orderId="" } = req.body || {};
+    const file = req.file;
+    if (!file) return res.status(400).json({ ok:false, error:"Falta archivo" });
+    const resultUrl = `${PUBLIC_BASE}/results/${path.basename(file.path)}`;
+
+    if (orderId) {
+      const db = loadOrders();
+      const idx = db.orders.findIndex(o => o.orderId === orderId);
+      if (idx >= 0) {
+        db.orders[idx].resultFileName = path.basename(file.path);
+        db.orders[idx].resultFileUrl = resultUrl;
+        db.orders[idx].status = "ready";
+        db.orders[idx].updatedAt = Date.now();
+        saveOrders(db);
+      }
+    }
+
+    if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && email) {
+      const t = nodemailer.createTransport({
+        host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465,
+        auth: { user: SMTP_USER, pass: SMTP_PASS }
+      });
+      await t.sendMail({
+        from: MAIL_FROM,
+        to: email,
+        subject: "Tu archivo modificado está listo",
+        html: `<p>Hola, tu archivo modificado está listo.</p><p>Descarga: <a href="${resultUrl}">${resultUrl}</a></p>`
+      });
+    }
+
+    res.json({ ok:true, url: resultUrl });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// ====== MERCADO PAGO (real) ======
+app.post("/payments/mp/create-preference", async (req, res) => {
+  try{
+    if(!MP_ACCESS_TOKEN) return res.status(400).json({ ok:false, error:"MP_ACCESS_TOKEN no configurado" });
+    const { orderId, amount } = req.body || {};
+    if(!orderId || !amount) return res.status(400).json({ ok:false, error:"Faltan orderId/amount" });
+    const preference = {
+      items: [{ title: `Chiptuning ${orderId}`, quantity: 1, currency_id: "ARS", unit_price: Number(amount) }],
+      back_urls: {
+        success: `${PUBLIC_BASE}/payments/mp/return?status=success&orderId=${orderId}`,
+        failure: `${PUBLIC_BASE}/payments/mp/return?status=failure&orderId=${orderId}`,
+        pending: `${PUBLIC_BASE}/payments/mp/return?status=pending&orderId=${orderId}`
+      },
+      auto_return: "approved",
+      notification_url: `${PUBLIC_BASE}/payments/mp/webhook`
+    };
+    const response = await mercadopago.preferences.create(preference);
+    res.json({ ok:true, id: response.body.id, init_point: response.body.init_point });
+  }catch(e){
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// Webhook Mercado Pago
+app.post("/payments/mp/webhook", express.json(), async (req, res) => {
+  try{
+    const body = req.body || {};
+    // En producción: consultar detalle de pago por id (body.data.id) y verificar estado "approved"
+    const orderId = (body?.data?.orderId) || req.query?.orderId || ""; // adaptar según notificación
+    if (orderId) {
+      const db = loadOrders();
+      const idx = db.orders.findIndex(o => o.orderId === orderId);
+      if (idx >= 0) {
+        db.orders[idx].paymentStatus = "approved";
+        db.orders[idx].paymentProvider = "mercadopago";
+        db.orders[idx].status = "paid";
+        db.orders[idx].updatedAt = Date.now();
+        saveOrders(db);
+      }
+    }
+    res.sendStatus(200);
+  }catch(e){
+    res.sendStatus(200);
+  }
+});
+
+// ====== PAYPAL (real) ======
+app.post("/payments/paypal/create-order", async (req, res) => {
+  try{
+    const { orderId, amount, currency="USD" } = req.body || {};
+    if(!orderId || !amount) return res.status(400).json({ ok:false, error:"Faltan datos" });
+    const request = new paypal.orders.OrdersCreateRequest();
+    request.prefer("return=representation");
+    request.requestBody({
+      intent: "CAPTURE",
+      purchase_units: [{
+        reference_id: orderId,
+        amount: { currency_code: currency, value: String(amount) }
+      }],
+      application_context: {
+        return_url: `${PUBLIC_BASE}/payments/paypal/return?orderId=${orderId}`,
+        cancel_url: `${PUBLIC_BASE}/payments/paypal/cancel?orderId=${orderId}`
+      }
+    });
+    const response = await paypalClient().execute(request);
+    const approve = response.result.links?.find(l=>l.rel==="approve")?.href;
+    res.json({ ok:true, id: response.result.id, approve });
+  }catch(e){
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.post("/payments/paypal/capture-order", async (req, res) => {
+  try{
+    const { paypalOrderId, orderId } = req.body || {};
+    if(!paypalOrderId || !orderId) return res.status(400).json({ ok:false, error:"Faltan ids" });
+    const request = new paypal.orders.OrdersCaptureRequest(paypalOrderId);
+    request.requestBody({});
+    const response = await paypalClient().execute(request);
+    if (response.result.status === "COMPLETED") {
+      const db = loadOrders();
+      const idx = db.orders.findIndex(o => o.orderId === orderId);
+      if (idx >= 0) {
+        db.orders[idx].paymentStatus = "approved";
+        db.orders[idx].paymentProvider = "paypal";
+        db.orders[idx].status = "paid";
+        db.orders[idx].updatedAt = Date.now();
+        saveOrders(db);
+      }
+    }
+    res.json({ ok:true, status: response.result.status });
+  }catch(e){
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.listen(PORT, () => console.log("Server running on", PORT));
