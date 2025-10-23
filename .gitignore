@@ -3,3 +3,8 @@ uploads/
 tmp/
 orders.json
 *.log
+node_modules/
+uploads/
+tmp/
+orders.json
+*.log
